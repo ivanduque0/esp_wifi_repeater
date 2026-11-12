@@ -111,6 +111,27 @@ static ip_addr_t my_ip;
 static ip_addr_t dns_ip;
 bool connected;
 uint8_t my_channel;
+
+/* Uplink backoff: while the STA keeps failing, the SDK rescans all channels
+ * and drags the single radio away from the soft-AP channel, which breaks the
+ * internal network (192.168.4.x). Every failed attempt stops the SDK retries:
+ * the next one comes STA_ATTEMPT_GAP seconds later, so each AP outage is a
+ * single scan, well below the 10 s a reset ESP-01 waits before power-cycling
+ * the repeater. After STA_MAX_FAILS failed attempts it waits
+ * STA_RETRY_INTERVAL seconds before the next round. */
+#define STA_MAX_FAILS 3
+#define STA_ATTEMPT_GAP 30
+#define STA_RETRY_INTERVAL (3 * 60 * 60) /* 3 hours */
+static uint8_t sta_fail_count = 0;
+static int32_t sta_backoff_cnt = -1; /* -1: not paused, >=0: seconds until retry */
+static bool sta_pause_pending = false;
+
+static void ICACHE_FLASH_ATTR sta_backoff_reset(void)
+{
+    sta_fail_count = 0;
+    sta_backoff_cnt = -1;
+    sta_pause_pending = false;
+}
 bool do_ip_config;
 int new_portmap;
 
@@ -1976,6 +1997,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         user_set_station_config();
         os_sprintf(response, "Trying to connect to ssid %s, password: %s\r\n", config.ssid, config.password);
 
+        sta_backoff_reset();
         wifi_station_disconnect();
         wifi_station_connect();
 
@@ -3703,6 +3725,16 @@ void ICACHE_FLASH_ATTR timer_func(void *arg)
 
     toggle = !toggle;
 
+    // Stop the SDK's own STA retries right after a failed uplink attempt
+    // (deferred from wifi_handle_event_cb; runs on every tick, <= 0.9 s)
+    if (sta_pause_pending)
+    {
+        sta_pause_pending = false;
+        os_printf("Uplink attempt %d/%d failed, next attempt in %d s\r\n",
+                  sta_fail_count, STA_MAX_FAILS, sta_backoff_cnt);
+        wifi_station_disconnect();
+    }
+
     // Check if watchdogs
     if (toggle)
     {
@@ -3726,6 +3758,24 @@ void ICACHE_FLASH_ATTR timer_func(void *arg)
                 return;
             }
             client_watchdog_cnt--;
+        }
+
+        // Uplink backoff (see sta_fail_count)
+        if (!sta_pause_pending && sta_backoff_cnt >= 0)
+        {
+            if (sta_backoff_cnt == 0)
+            {
+                sta_backoff_cnt = -1;
+                // After the long wait, a new round of STA_MAX_FAILS attempts
+                if (sta_fail_count >= STA_MAX_FAILS)
+                    sta_fail_count = 0;
+                os_printf("Retrying uplink connection to %s\r\n", config.ssid);
+                wifi_station_connect();
+            }
+            else
+            {
+                sta_backoff_cnt--;
+            }
         }
     }
 
@@ -4067,6 +4117,17 @@ void wifi_handle_event_cb(System_Event_t *evt)
             return;
         }
 
+        // Reason 8 (ASSOC_LEAVE) is our own disconnect, not an uplink failure
+        if (config.ap_on && config.auto_connect &&
+            evt->event_info.disconnected.reason != 8 &&
+            sta_backoff_cnt < 0 && !sta_pause_pending)
+        {
+            sta_fail_count++;
+            // wifi_station_disconnect() is deferred to timer_func
+            sta_pause_pending = true;
+            sta_backoff_cnt = (sta_fail_count >= STA_MAX_FAILS) ? STA_RETRY_INTERVAL : STA_ATTEMPT_GAP;
+        }
+
         break;
 
     case EVENT_STAMODE_AUTHMODE_CHANGE:
@@ -4085,6 +4146,7 @@ void wifi_handle_event_cb(System_Event_t *evt)
 
         my_ip = evt->event_info.got_ip.ip;
         connected = true;
+        sta_backoff_reset();
 
 #ifndef REPEATER_MODE
         patch_netif(my_ip, my_input_sta, &orig_input_sta, my_output_sta, &orig_output_sta, false);
